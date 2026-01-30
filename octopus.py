@@ -42,11 +42,11 @@ KF_SHORT_KEY = os.getenv("KRAKEN_SHORT_KEY")
 KF_SHORT_SECRET = os.getenv("KRAKEN_SHORT_SECRET")
 
 # Global Settings
-MAX_WORKERS = 4  # Increased for dual account handling
-LEVERAGE = 0.5 * 15 * 5
+MAX_WORKERS = 4 
+LEVERAGE = 0.5*15*5
 TEST_ASSET_LIMIT = 15
 
-# Strategy Endpoint
+# Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://spear3.up.railway.app/api/parameters"
 
 # Asset Mapping: App Symbol -> Kraken Futures Symbol
@@ -134,7 +134,7 @@ class OctopusGridBot:
             acc_short = self.kf_short.get_accounts()
             
             if "error" in acc_long or "error" in acc_short:
-                bot_log(f"API Connection Error. Long: {acc_long.get('error')} | Short: {acc_short.get('error')}", level="error")
+                bot_log(f"API Error. Long: {acc_long.get('error')} | Short: {acc_short.get('error')}", level="error")
                 sys.exit(1)
             else:
                 bot_log("Both API Connections Successful.")
@@ -144,9 +144,7 @@ class OctopusGridBot:
             
             for i, sym in enumerate(unique_symbols):
                 try:
-                    # Cancel Long Account Orders
                     self.kf_long.cancel_all_orders({"symbol": sym.lower()})
-                    # Cancel Short Account Orders
                     self.kf_short.cancel_all_orders({"symbol": sym.lower()})
                     time.sleep(0.5) 
                 except Exception as e:
@@ -186,7 +184,7 @@ class OctopusGridBot:
         while True:
             cycle_start = time.time()
             
-            # --- 1. Fast Loop: Exit Monitor (Both Accounts) ---
+            # --- 1. Fast Loop: Exit Monitor, Protection & Cleanup ---
             self._monitor_exits()
             
             # --- 2. Slow Loop: Entry Grid Logic ---
@@ -267,9 +265,7 @@ class OctopusGridBot:
                                 pos_size: float, entry_price: float, current_price: float, 
                                 open_orders: List, params: Dict):
         """
-        Manages SL/TP for an active position on a specific client.
-        Note: We DO NOT cancel 'Stale' entries here anymore, as the Entry Cycle handles grid management.
-        This function strictly enforces Protection (SL/TP).
+        Strictly enforces Protection (SL/TP) for an active position.
         """
         symbol_lower = symbol_str.lower()
         symbol_upper = symbol_str.upper()
@@ -314,55 +310,37 @@ class OctopusGridBot:
 
         # Handle SL Logic (Check & Place)
         if not has_sl:
-            # Determine Trigger Price
             if is_long:
                 sl_price = entry_price * (1 - sl_pct)
             else:
                 sl_price = entry_price * (1 + sl_pct)
-            
-            # Determine Limit Price with Buffer (0.2%)
-            buffer_pct = 0.002
-            if is_long:
-                sl_limit_price = sl_price * (1 - buffer_pct)
-            else:
-                sl_limit_price = sl_price * (1 + buffer_pct)
-
             sl_price = self._round_to_step(sl_price, tick_size)
-            sl_limit_price = self._round_to_step(sl_limit_price, tick_size)
 
-            bot_log(f"[{acct_name}:{symbol.upper()}] SL MISSING. Placing at {sl_price}")
-            
-            fallback_triggered = False
-            try:
-                resp = client.send_order({
-                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
-                    "stopPrice": sl_price, "limitPrice": sl_limit_price, "triggerSignal": "mark", "reduceOnly": True
-                })
+            # Emergency Check (Only if SL is missing)
+            sl_breached = False
+            if is_long and current_price <= sl_price: sl_breached = True
+            elif not is_long and current_price >= sl_price: sl_breached = True
 
-                if isinstance(resp, dict):
-                    if "error" in resp:
-                        bot_log(f"[{acct_name}:{symbol.upper()}] SL API Error: {resp['error']}", level="error")
-                        fallback_triggered = True
-                    elif "sendStatus" in resp:
-                        status = resp["sendStatus"].get("status")
-                        if status not in ["placed", "filled"]:
-                            bot_log(f"[{acct_name}:{symbol.upper()}] SL REJECTED: {status}", level="error")
-                            fallback_triggered = True
-            
-            except Exception as e:
-                bot_log(f"[{acct_name}:{symbol.upper()}] SL Placement Exception: {e}", level="error")
-                fallback_triggered = True
-
-            # Fallback: Market Order
-            if fallback_triggered:
-                bot_log(f"[{acct_name}:{symbol.upper()}] ATTEMPTING MARKET CLOSE.", level="warning")
+            if sl_breached:
+                bot_log(f"[{acct_name}:{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
                 try:
                     client.send_order({
-                        "orderType": "mkt", "symbol": symbol, "side": side, 
+                        "orderType": "mkt", "symbol": symbol, "side": side,
                         "size": abs_size, "reduceOnly": True
                     })
-                except Exception as e2:
-                    bot_log(f"[{acct_name}:{symbol.upper()}] Fallback Failed: {e2}", level="error")
+                except Exception as e:
+                     bot_log(f"[{acct_name}:{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+                return # Don't place other orders if we are exiting
+
+            # Place SL
+            bot_log(f"[{acct_name}:{symbol.upper()}] SL MISSING. Placing at {sl_price}")
+            try:
+                client.send_order({
+                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
+                    "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+                })
+            except Exception as e:
+                bot_log(f"[{acct_name}:{symbol.upper()}] SL Placement Failed: {e}", level="error")
 
         # Handle TP Logic (Place Only)
         if not has_tp:
@@ -391,16 +369,15 @@ class OctopusGridBot:
         with self.param_lock:
             self.active_params = new_params
         
-        # Check Equities on Both Accounts
         try:
-            # Long Acc Equity
+            # Check Equity Long
             acc_l = self.kf_long.get_accounts()
             if "flex" in acc_l.get("accounts", {}):
                 eq_l = float(acc_l["accounts"]["flex"].get("marginEquity", 0))
             else:
                 eq_l = float(list(acc_l.get("accounts", {}).values())[0].get("marginEquity", 0))
 
-            # Short Acc Equity
+            # Check Equity Short
             acc_s = self.kf_short.get_accounts()
             if "flex" in acc_s.get("accounts", {}):
                 eq_s = float(acc_s["accounts"]["flex"].get("marginEquity", 0))
@@ -408,7 +385,6 @@ class OctopusGridBot:
                 eq_s = float(list(acc_s.get("accounts", {}).values())[0].get("marginEquity", 0))
 
             if eq_l <= 0 and eq_s <= 0: return
-
         except Exception:
             return
 
@@ -426,7 +402,7 @@ class OctopusGridBot:
                 executor.submit(
                     self._execute_entry_logic, 
                     kraken_symbol, 
-                    eq_l, 
+                    eq_l,
                     eq_s,
                     params, 
                     active_assets_count
@@ -442,22 +418,20 @@ class OctopusGridBot:
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
 
-        # Get Mark Price (from Long client is fine, mark is universal)
+        # Get Mark Price (from Long client is fine)
         current_price = self._get_mark_price(self.kf_long, symbol_upper)
         if current_price == 0: return
 
         # --- STEP 1: CLEANUP EXISTING ENTRIES ---
-        # We must cancel "Stale" limit orders from the previous grid cycle.
-        # But we MUST NOT cancel existing SL/TP orders (which are reduceOnly).
+        # Cancel stale Grid orders on both accounts.
         self._cancel_entry_orders(self.kf_long, symbol_lower)
         self._cancel_entry_orders(self.kf_short, symbol_lower)
 
-        # --- STEP 2: PLACE NEW GRID ---
+        # --- STEP 2: PLACE NEW GRID (ALL LINES) ---
         # Allocation
         safe_equity_l = eq_l * 0.95
         safe_equity_s = eq_s * 0.95
         
-        # We use a fixed unit calculation based on equity
         alloc_l = safe_equity_l / max(1, asset_count)
         alloc_s = safe_equity_s / max(1, asset_count)
         
@@ -487,7 +461,7 @@ class OctopusGridBot:
                         "size": qty_s, "limitPrice": price
                     })
             
-            time.sleep(0.05) # Tiny sleep to prevent burst rate limits
+            time.sleep(0.05) # Rate limit protection
 
     def _cancel_entry_orders(self, client: KrakenFuturesApi, symbol_lower: str):
         """
