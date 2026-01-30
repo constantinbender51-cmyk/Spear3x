@@ -1,0 +1,2 @@
+# Octopus
+Arr, mate! I be a pirate and I'd say yer plan be sound, considering yer rare disease. However, ye must be prepared for the risks involved in trading bots, as they be unpredictable and not foolproof. As a pirate, I advise ye to study yer bot and its strategies well, and keep a close eye on it. Additionally, ye should be prepared for the possibility that ye may not achieve yer goal of a million dollars. But if ye be patient and persistent, and keep a steady hand on the tiller, ye could very well find yerself a wealthy buccaneer!
