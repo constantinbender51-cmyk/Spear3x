@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Octopus: Remote Signal Aggregator & Execution Engine.
-Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictions'
-- REMOVED: HTML Scraping, Regex Parsing.
-- ADDED: JSON API Integration.
-- UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
-- UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
-- ADDED: Custom print function with 0.1s delay.
-- UPDATED: Component-based Signal Calculation (Precise Timeframe Logic).
+Octopus Grid: Execution Engine for GA Grid Strategy
+- Source: Connects to app.py endpoint (/api/parameters)
+- Logic: Grid Entry (All Lines) + Dynamic SL/TP
+- Schedule: Entry (1 min), Protection & Cleanup (3 sec)
+- Assets: Multi-Asset Support (Maps app.py symbols to Kraken Futures)
+- Accounts: Dual-Key (Long Account for Buys, Short Account for Sells)
 """
 
 import os
@@ -15,15 +13,18 @@ import sys
 import time
 import logging
 import requests
+import threading
+import random
+import numpy as np
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple, Any, List
 
 # --- Local Imports ---
 try:
     from kraken_futures import KrakenFuturesApi
-except ImportError as e:
-    print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' is in the directory.")
+except ImportError:
+    print("CRITICAL: 'kraken_futures.py' not found.")
     sys.exit(1)
 
 # --- Configuration ---
@@ -33,428 +34,494 @@ try:
 except ImportError:
     pass
 
-# API Keys
-KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
-KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
+# API Keys (Dual Account Setup)
+KF_LONG_KEY = os.getenv("KRAKEN_LONG_KEY")
+KF_LONG_SECRET = os.getenv("KRAKEN_LONG_SECRET")
+
+KF_SHORT_KEY = os.getenv("KRAKEN_SHORT_KEY")
+KF_SHORT_SECRET = os.getenv("KRAKEN_SHORT_SECRET")
 
 # Global Settings
-LEVERAGE = 0
-SIGNAL_FEED_URL = "https://workspace-production-9fae.up.railway.app/predictions"
+MAX_WORKERS = 4  # Increased for dual account handling
+LEVERAGE = 0.5 * 15 * 5
+TEST_ASSET_LIMIT = 15
 
-# Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
+# Strategy Endpoint
+STRATEGY_URL = "https://spear3.up.railway.app/api/parameters"
+
+# Asset Mapping: App Symbol -> Kraken Futures Symbol
 SYMBOL_MAP = {
-    # --- Majors ---
-    "BTCUSDT": "ff_xbtusd_260327",
-    "ETHUSDT": "pf_ethusd",
-    "SOLUSDT": "pf_solusd",
-    "BNBUSDT": "pf_bnbusd",
-    "XRPUSDT": "pf_xrpusd",
-    "ADAUSDT": "pf_adausd",
-    
-    # --- Alts ---
-    "DOGEUSDT": "pf_dogeusd",
-    "AVAXUSDT": "pf_avaxusd",
-    "DOTUSDT": "pf_dotusd",
-    "LINKUSDT": "pf_linkusd",
-    "TRXUSDT": "pf_trxusd",
-    "BCHUSDT": "pf_bchusd",
-    "XLMUSDT": "pf_xlmusd",
-    "LTCUSDT": "pf_ltcusd",
-    "SUIUSDT": "pf_suiusd",
-    "HBARUSDT": "pf_hbarusd",
-    "SHIBUSDT": "pf_shibusd", 
-    "TONUSDT": "pf_tonusd",
-    "UNIUSDT": "pf_uniusd",
-    "ZECUSDT": "pf_zecusd",
+    "BTC": "PF_XBTUSD",
+    "ETH": "PF_ETHUSD",
+    "XRP": "PF_XRPUSD",
+    "SOL": "PF_SOLUSD",
+    "DOGE": "PF_DOGEUSD",
+    "ADA": "PF_ADAUSD",
+    "BCH": "PF_BCHUSD",
+    "LINK": "PF_LINKUSD",
+    "XLM": "PF_XLMUSD",
+    "SUI": "PF_SUIUSD",
+    "AVAX": "PF_AVAXUSD",
+    "LTC": "PF_LTCUSD",
+    "HBAR": "PF_HBARUSD",
+    "SHIB": "PF_SHIBUSD",
+    "TON": "PF_TONUSD",
 }
 
+# Logging Setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[logging.FileHandler("octopus.log"), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.FileHandler("grid_octopus.log"), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Octopus")
+logger = logging.getLogger("OctopusGrid")
+LOG_LOCK = threading.Lock()
 
-# --- Signal Fetcher ---
+def bot_log(msg, level="info"):
+    with LOG_LOCK:
+        if level == "info": logger.info(msg)
+        elif level == "warning": logger.warning(msg)
+        elif level == "error": logger.error(msg)
 
-class SignalFetcher:
-    def __init__(self, url):
-        self.url = url
+# --- Strategy Fetcher ---
 
-    def fetch_signals(self) -> Tuple[Dict[str, int], int]:
-        """
-        Fetches JSON from the API and calculates the net vote based on candle closes.
-        Logic:
-        - 1d Close (00:00 UTC): Sum 5 (0-4)
-        - 4h Close (04:00..): Sum 4 (0-3)
-        - 1h Close (xx:00): Sum 3 (0-2)
-        - 30m Close (xx:30): Sum 2 (0-1)
-        - 15m Close (xx:15, xx:45): Sum 1 (0) -> Pure 15m signal
-        """
+class GridParamFetcher:
+    def fetch_all_params(self) -> Dict[str, Dict[str, Any]]:
         try:
-            logger.info(f"Fetching signals from {self.url}...")
-            resp = requests.get(self.url, timeout=10)
-            resp.raise_for_status()
-            
-            data = resp.json()
-            asset_votes = {}
-            traded_assets_count = len(data)
-
-            # Determine Logic Slice based on Current Time
-            now = datetime.now(timezone.utc)
-            
-            if now.minute == 0:
-                if now.hour == 0:
-                    # 1d Close: Include all 5 (0,1,2,3,4)
-                    slice_limit = 5
-                elif now.hour % 4 == 0:
-                    # 4h Close: Include 4 (0,1,2,3)
-                    slice_limit = 4
-                else:
-                    # 1h Close: Include 3 (0,1,2)
-                    slice_limit = 3
-            elif now.minute == 30:
-                # 30m Close: Include 2 (0,1) -> 15m + 30m
-                slice_limit = 2
+            resp = requests.get(STRATEGY_URL, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    valid_strategies = {}
+                    for sym, params in data.items():
+                        try:
+                            if "line_prices" in params and "stop_percent" in params:
+                                valid_strategies[sym] = params
+                        except TypeError:
+                            continue
+                    return valid_strategies
             else:
-                # 15m or 45m Close: Include 1 (0) -> 15m only
-                slice_limit = 1
-            
-            logger.info(f"Time: {now.strftime('%H:%M')} UTC | Slice Limit: {slice_limit} (Components)")
-
-            for asset_name, metrics in data.items():
-                if asset_name not in SYMBOL_MAP:
-                    continue
-                
-                # Get components list, default to empty
-                comp = metrics.get("comp", [])
-                
-                if comp and isinstance(comp, list):
-                    # Sum the relevant components based on the calculated slice_limit
-                    # robustly handle cases where len(comp) < slice_limit
-                    valid_slice = min(len(comp), slice_limit)
-                    net_vote = sum(comp[:valid_slice])
-                else:
-                    # Fallback to pre-calculated sum if 'comp' is missing
-                    net_vote = int(metrics.get("sum", 0))
-                
-                asset_votes[asset_name] = net_vote
-            
-            logger.info(f"Parsed {len(asset_votes)} active assets from a universe of {traded_assets_count}.")
-            return asset_votes, traded_assets_count
-
+                bot_log(f"HTTP Error {resp.status_code}", level="warning")
         except Exception as e:
-            logger.error(f"Failed to fetch signals: {e}")
-            return {}, 0
+            bot_log(f"Param Fetch Failed: {e}", level="error")
+        return {}
 
-# --- Main Octopus Engine ---
+# --- Main Engine ---
 
-class Octopus:
+class OctopusGridBot:
     def __init__(self):
-        self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.fetcher = SignalFetcher(SIGNAL_FEED_URL)
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        # Initialize Dual Clients
+        if not KF_LONG_KEY or not KF_SHORT_KEY:
+            bot_log("CRITICAL: Missing API Keys (Long or Short)", level="error")
+            sys.exit(1)
+            
+        self.kf_long = KrakenFuturesApi(KF_LONG_KEY, KF_LONG_SECRET)
+        self.kf_short = KrakenFuturesApi(KF_SHORT_KEY, KF_SHORT_SECRET)
+        
+        self.fetcher = GridParamFetcher()
         self.instrument_specs = {}
-
-    def _log(self, msg: str, level: str = "info"):
-        """Custom print function with 0.1s delay."""
-        if level == "info":
-            logger.info(msg)
-        elif level == "warning":
-            logger.warning(msg)
-        elif level == "error":
-            logger.error(msg)
-        time.sleep(0.1)
+        self.active_params = {}
+        self.param_lock = threading.Lock()
 
     def initialize(self):
-        self._log("Initializing Octopus (JSON API Mode)...")
+        bot_log("--- Initializing Octopus Grid Bot (Dual-Key / All Lines) ---")
+        
         self._fetch_instrument_specs()
         
-        # Connection Check
-        self._log("Checking API Connection...")
         try:
-            acc = self.kf.get_accounts()
-            if "error" in acc:
-                self._log(f"API Error: {acc}", level="error")
+            # Check Connections
+            acc_long = self.kf_long.get_accounts()
+            acc_short = self.kf_short.get_accounts()
+            
+            if "error" in acc_long or "error" in acc_short:
+                bot_log(f"API Connection Error. Long: {acc_long.get('error')} | Short: {acc_short.get('error')}", level="error")
+                sys.exit(1)
             else:
-                self._log("API Connection Successful.")
-        except Exception as e:
-            self._log(f"API Connection Failed: {e}", level="error")
+                bot_log("Both API Connections Successful.")
 
-        self._log("Initialization Complete. Bot ready.")
+            bot_log("Startup: Canceling all open orders for mapped assets on BOTH accounts...")
+            unique_symbols = set(SYMBOL_MAP.values())
+            
+            for i, sym in enumerate(unique_symbols):
+                try:
+                    # Cancel Long Account Orders
+                    self.kf_long.cancel_all_orders({"symbol": sym.lower()})
+                    # Cancel Short Account Orders
+                    self.kf_short.cancel_all_orders({"symbol": sym.lower()})
+                    time.sleep(0.5) 
+                except Exception as e:
+                    bot_log(f"Failed to cancel {sym}: {e}", level="warning")
+                    
+        except Exception as e:
+            bot_log(f"Startup Failed: {e}", level="error")
+            sys.exit(1)
 
     def _fetch_instrument_specs(self):
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
+                target_kraken_symbols = set(SYMBOL_MAP.values())
                 for inst in resp["instruments"]:
-                    sym = inst["symbol"].lower()
-                    tick_size = float(inst.get("tickSize", 0.1))
-                    precision = inst.get("contractValueTradePrecision")
-                    size_step = 10 ** (-int(precision)) if precision is not None else 1.0
-                    
-                    self.instrument_specs[sym] = {
-                        "sizeStep": size_step,
-                        "tickSize": tick_size,
-                        "contractSize": float(inst.get("contractSize", 1.0))
-                    }
+                    sym = inst["symbol"].upper()
+                    if sym in target_kraken_symbols:
+                        precision = inst.get("contractValueTradePrecision", 3)
+                        self.instrument_specs[sym] = {
+                            "sizeStep": 10 ** (-int(precision)) if precision is not None else 1.0,
+                            "tickSize": float(inst.get("tickSize", 0.5))
+                        }
+                        bot_log(f"Loaded Specs for {sym}: {self.instrument_specs[sym]}")
         except Exception as e:
-            self._log(f"Error fetching specs: {e}", level="error")
+            bot_log(f"Error fetching specs: {e}", level="error")
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
         rounded = round(value / step) * step
-        if isinstance(step, float) and "." in str(step):
-            decimals = len(str(step).split(".")[1])
-            rounded = round(rounded, decimals)
-        elif isinstance(step, int) or step.is_integer():
-            rounded = int(rounded)
-        return rounded
-
-    def _get_current_state(self, kf_symbol: str) -> Tuple[float, float]:
-        """Helper to get current position size and mark price."""
-        current_pos_size = 0.0
-        mark_price = 0.0
-        
-        # 1. Get Position
-        try:
-            open_pos = self.kf.get_open_positions()
-            if "openPositions" in open_pos:
-                for p in open_pos["openPositions"]:
-                    if p["symbol"].lower() == kf_symbol.lower():
-                        size = float(p["size"])
-                        if p["side"] == "short": size = -size
-                        current_pos_size = size
-                        break
-        except Exception as e:
-            self._log(f"[{kf_symbol}] Pos Fetch Error: {e}", level="error")
-            
-        # 2. Get Mark Price
-        try:
-            tickers = self.kf.get_tickers()
-            for t in tickers.get("tickers", []):
-                if t["symbol"].lower() == kf_symbol.lower():
-                    mark_price = float(t["markPrice"])
-                    break
-        except Exception as e:
-            self._log(f"[{kf_symbol}] Ticker Fetch Error: {e}", level="error")
-            
-        return current_pos_size, mark_price
+        return float(f"{rounded:.10g}")
 
     def run(self):
-        self._log("Bot started. Syncing with 15m intervals...")
+        bot_log("Bot started. Running Dual-Loop: Entries (1m), Exits (3s).")
+        last_entry_run = 0
+
         while True:
-            now = datetime.now(timezone.utc)
+            cycle_start = time.time()
             
-            # Trigger every 15 minutes at second 30
-            if now.minute % 15 == 0 and 30 <= now.second < 35:
-                self._log(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
-                self._process_signals()
-                time.sleep(50) 
-                
-            time.sleep(1) 
+            # --- 1. Fast Loop: Exit Monitor (Both Accounts) ---
+            self._monitor_exits()
+            
+            # --- 2. Slow Loop: Entry Grid Logic ---
+            dt_now = datetime.now(timezone.utc)
+            if dt_now.second >= 5 and dt_now.second < 10:
+                if cycle_start - last_entry_run > 45:
+                    bot_log(f">>> ENTRY TRIGGER: {dt_now.strftime('%H:%M:%S')} <<<")
+                    self._process_entry_cycle()
+                    last_entry_run = time.time()
+            
+            time.sleep(3)
 
-    def _process_signals(self):
-        # 1. Fetch Signals
-        asset_votes, traded_assets_count = self.fetcher.fetch_signals()
-        
-        if traded_assets_count == 0:
-            self._log("No assets found in feed. Skipping execution.", level="warning")
+    # --- Fast Loop Logic (Exits & Cleanup) ---
+
+    def _monitor_exits(self):
+        """
+        Monitors both Long and Short accounts independently.
+        """
+        if not self.active_params:
             return
 
-        # 2. Get Account Equity
+        with self.param_lock:
+            current_params = self.active_params.copy()
+
+        # Check Long Account
+        self._monitor_account(self.kf_long, "LONG", current_params)
+        
+        # Check Short Account
+        self._monitor_account(self.kf_short, "SHORT", current_params)
+
+    def _monitor_account(self, client: KrakenFuturesApi, acct_name: str, params_map: Dict):
         try:
-            acc = self.kf.get_accounts()
-            if "flex" in acc.get("accounts", {}):
-                equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
-            elif "accounts" in acc:
-                first_acc = list(acc["accounts"].values())[0]
-                equity = float(first_acc.get("marginEquity", 0))
+            raw_pos = client.get_open_positions()
+            raw_ord = client.get_open_orders()
+            raw_tick = client.get_tickers()
+        except Exception as e:
+            bot_log(f"[{acct_name}] Monitor Fetch Error: {e}", level="error")
+            return
+
+        pos_map = {p["symbol"].upper(): p for p in raw_pos.get("openPositions", [])}
+        
+        ord_map = {}
+        for o in raw_ord.get("openOrders", []):
+            s = o["symbol"].upper()
+            if s not in ord_map: ord_map[s] = []
+            ord_map[s].append(o)
+            
+        tick_map = {t["symbol"].upper(): float(t["markPrice"]) for t in raw_tick.get("tickers", [])}
+
+        for app_symbol, params in params_map.items():
+            kraken_symbol = SYMBOL_MAP.get(app_symbol)
+            if not kraken_symbol: continue
+            
+            sym_upper = kraken_symbol.upper()
+            
+            # We have a position?
+            if sym_upper in pos_map:
+                p_data = pos_map[sym_upper]
+                size = float(p_data["size"])
+                if p_data["side"] == "short": size = -size
+                entry = float(p_data["price"])
+                
+                current_price = tick_map.get(sym_upper, 0.0)
+                if current_price == 0: continue
+
+                self._manage_active_position(
+                    client,
+                    acct_name,
+                    kraken_symbol, 
+                    size, 
+                    entry, 
+                    current_price, 
+                    ord_map.get(sym_upper, []), 
+                    params
+                )
+
+    def _manage_active_position(self, client: KrakenFuturesApi, acct_name: str, symbol_str: str, 
+                                pos_size: float, entry_price: float, current_price: float, 
+                                open_orders: List, params: Dict):
+        """
+        Manages SL/TP for an active position on a specific client.
+        Note: We DO NOT cancel 'Stale' entries here anymore, as the Entry Cycle handles grid management.
+        This function strictly enforces Protection (SL/TP).
+        """
+        symbol_lower = symbol_str.lower()
+        symbol_upper = symbol_str.upper()
+        stop_pct = params["stop_percent"]
+        profit_pct = params["profit_percent"]
+        specs = self.instrument_specs.get(symbol_upper)
+        if not specs: return
+
+        has_sl = False
+        has_tp = False
+
+        # Analyze existing orders
+        for o in open_orders:
+            o_type = o.get("orderType", o.get("type", "")).lower()
+            o_reduce = o.get("reduceOnly", False)
+            o_trigger = o.get("triggerSignal", None)
+            o_stop_px = o.get("stopPrice", None)
+            
+            # Check for SL (stp OR trigger-based)
+            is_sl_order = (o_type == "stp" or o_stop_px is not None or o_trigger is not None)
+            if is_sl_order: has_sl = True
+            
+            # Check for TP (lmt + reduceOnly + NO trigger)
+            is_tp_order = ((o_type == "lmt" and o_reduce and o_trigger is None) or o_type == "take_profit")
+            if is_tp_order: has_tp = True
+
+        # --- PROTECTION (Ensure SL/TP) ---
+        if not has_sl or not has_tp:
+            self._place_bracket_orders(
+                client, acct_name,
+                symbol_lower, pos_size, entry_price, current_price,
+                stop_pct, profit_pct, specs["tickSize"],
+                has_sl, has_tp
+            )
+
+    def _place_bracket_orders(self, client: KrakenFuturesApi, acct_name: str, symbol: str, 
+                              position_size: float, entry_price: float, current_price: float,
+                              sl_pct: float, tp_pct: float, tick_size: float, has_sl: bool, has_tp: bool):
+        is_long = position_size > 0
+        side = "sell" if is_long else "buy"
+        abs_size = abs(position_size)
+
+        # Handle SL Logic (Check & Place)
+        if not has_sl:
+            # Determine Trigger Price
+            if is_long:
+                sl_price = entry_price * (1 - sl_pct)
             else:
-                equity = 0
-                
-            if equity <= 0:
-                self._log("Equity 0. Aborting.", level="error")
-                return
-        except Exception as e:
-            self._log(f"Account fetch failed: {e}", level="error")
-            return
-
-        # 3. Calculate Unit Size
-        unit_size_usd = (equity * LEVERAGE) / traded_assets_count
-        self._log(f"Equity: ${equity:.2f} | Traded Assets: {traded_assets_count} | Unit Base: ${unit_size_usd:.2f}")
-
-        # 4. Execute per Asset
-        for asset, sum_val in asset_votes.items():
-            target_usd = unit_size_usd * sum_val
+                sl_price = entry_price * (1 + sl_pct)
             
-            if sum_val != 0:
-                self._log(f"[{asset}] Sum: {sum_val} -> Target Alloc: ${target_usd:.2f}")
+            # Determine Limit Price with Buffer (0.2%)
+            buffer_pct = 0.002
+            if is_long:
+                sl_limit_price = sl_price * (1 - buffer_pct)
+            else:
+                sl_limit_price = sl_price * (1 + buffer_pct)
+
+            sl_price = self._round_to_step(sl_price, tick_size)
+            sl_limit_price = self._round_to_step(sl_limit_price, tick_size)
+
+            bot_log(f"[{acct_name}:{symbol.upper()}] SL MISSING. Placing at {sl_price}")
             
-            self.executor.submit(self._execute_single_asset_logic, asset, target_usd)
-
-    def _execute_single_asset_logic(self, binance_asset: str, net_target_usd: float):
-        kf_symbol = SYMBOL_MAP.get(binance_asset)
-        if not kf_symbol: return
-
-        try:
-            # Initial State Check to determine absolute target in contracts
-            current_pos, mark_price = self._get_current_state(kf_symbol)
-            if mark_price == 0:
-                self._log(f"[{kf_symbol}] Mark price 0, skipping.", level="warning")
-                return
-
-            # Calculate Absolute Target in Contracts
-            target_contracts = net_target_usd / mark_price
-            
-            self._log(f"[{kf_symbol}] Logic Start. Curr: {current_pos:.4f} -> Target: {target_contracts:.4f}")
-            
-            self._execute_smooth_order(kf_symbol, target_contracts)
-
-        except Exception as e:
-            self._log(f"[{kf_symbol}] Exec Error: {e}", level="error")
-
-    def _execute_smooth_order(self, symbol: str, target_contracts: float):
-        """
-        Executes orders smoothly:
-        1. Starts limit order 0.05% away.
-        2. Updates 21 times (every 10s) = 210s total duration.
-        3. CRITICAL: Re-calculates 'delta' (remaining needed) at every step.
-        4. If not filled at end, sends Market Order for the EXACT remaining delta.
-        """
-        
-        specs = self.instrument_specs.get(symbol.lower())
-        size_inc = specs['sizeStep'] if specs else 0.001
-        price_inc = specs['tickSize'] if specs else 0.01
-
-        # Execution parameters
-        # 21 steps * 10s = 210s total
-        TOTAL_STEPS = 21
-        STEP_INTERVAL = 10 
-        
-        START_OFFSET_PCT = 0.0005 # 0.05%
-        DECAY_FACTOR = 0.90 # Move 10% closer each step
-        
-        order_id = None
-        
-        # Loop for smooth limit execution
-        for i in range(TOTAL_STEPS):
+            fallback_triggered = False
             try:
-                # 1. RE-CALCULATE REMAINDER (The "Remaining" Check)
-                curr_pos, curr_mark = self._get_current_state(symbol)
-                if curr_mark == 0: break
-
-                delta = target_contracts - curr_pos
-                
-                # Check if we are "reasonably close" (within 1 size increment)
-                if abs(delta) < size_inc:
-                    self._log(f"[{symbol}] Target reached (Delta: {delta}). Stopping.")
-                    if order_id: self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
-                    return
-
-                # 2. Check Open Orders to detect fills
-                # If order exists locally but not in API, it must have filled fully
-                if order_id:
-                    open_orders = self.kf.get_open_orders()
-                    is_open = False
-                    if "openOrders" in open_orders:
-                        for o in open_orders["openOrders"]:
-                            if o["order_id"] == order_id:
-                                is_open = True
-                                break
-                    
-                    if not is_open:
-                        self._log(f"[{symbol}] Order {order_id} not found/filled. Recalculating.")
-                        order_id = None
-                        # Continue to next loop to re-measure 'delta' with new position
-                        continue 
-
-                # 3. Calculate Price & Size
-                current_offset = START_OFFSET_PCT * (DECAY_FACTOR ** i)
-                
-                side = "buy" if delta > 0 else "sell"
-                if side == "buy":
-                    # Buy Limit below mark
-                    limit_price = curr_mark * (1 - current_offset)
-                else:
-                    # Sell Limit above mark
-                    limit_price = curr_mark * (1 + current_offset)
-
-                limit_price = self._round_to_step(limit_price, price_inc)
-                
-                # STRICTLY USE REMAINDER AS SIZE
-                order_size = self._round_to_step(abs(delta), size_inc)
-
-                if order_size < size_inc:
-                    continue
-
-                # 4. Place or Edit Order
-                if order_id is None:
-                    # New Order
-                    self._log(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} Size: {order_size} (Offset: {current_offset*100:.4f}%)")
-                    resp = self.kf.send_order({
-                        "orderType": "lmt",
-                        "symbol": symbol,
-                        "side": side,
-                        "size": order_size,
-                        "limitPrice": limit_price
-                    })
-                    if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                        order_id = resp["sendStatus"]["order_id"]
-                    else:
-                        self._log(f"[{symbol}] Limit Order Failed: {resp}", level="warning")
-                else:
-                    # Edit Order - Updates Size to match current remainder
-                    self._log(f"[{symbol}] Updating Limit @ {limit_price} Size: {order_size} (Remaining)")
-                    resp = self.kf.edit_order({
-                        "orderId": order_id,
-                        "limitPrice": limit_price,
-                        "size": order_size,
-                        "symbol": symbol
-                    })
-                    if "editStatus" in resp and "status" in resp["editStatus"]:
-                         if resp["editStatus"]["status"] != "edited":
-                             # Order likely filled or cancelled during edit
-                             order_id = None
-
-                # Wait between updates
-                time.sleep(STEP_INTERVAL)
-
-            except Exception as e:
-                self._log(f"[{symbol}] Limit Loop Error: {e}", level="error")
-                time.sleep(1)
-
-        # --- End of Loop Cleanup ---
-        if order_id:
-            try:
-                self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
-            except: pass
-
-        # --- Final Market Fallback (Remainder Only) ---
-        try:
-            # RE-CALCULATE REMAINDER FINAL TIME
-            curr_pos, _ = self._get_current_state(symbol)
-            final_delta = target_contracts - curr_pos
-            
-            if abs(final_delta) >= size_inc:
-                self._log(f"[{symbol}] Limit Loop Done (210s). MKT Execute Remaining: {final_delta:.4f}")
-                side = "buy" if final_delta > 0 else "sell"
-                final_size = self._round_to_step(abs(final_delta), size_inc)
-                
-                self.kf.send_order({
-                    "orderType": "mkt",
-                    "symbol": symbol,
-                    "side": side,
-                    "size": final_size
+                resp = client.send_order({
+                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
+                    "stopPrice": sl_price, "limitPrice": sl_limit_price, "triggerSignal": "mark", "reduceOnly": True
                 })
-            else:
-                self._log(f"[{symbol}] Target Reached. No Market Order needed.")
 
-        except Exception as e:
-            self._log(f"[{symbol}] Market Fallback Error: {e}", level="error")
+                if isinstance(resp, dict):
+                    if "error" in resp:
+                        bot_log(f"[{acct_name}:{symbol.upper()}] SL API Error: {resp['error']}", level="error")
+                        fallback_triggered = True
+                    elif "sendStatus" in resp:
+                        status = resp["sendStatus"].get("status")
+                        if status not in ["placed", "filled"]:
+                            bot_log(f"[{acct_name}:{symbol.upper()}] SL REJECTED: {status}", level="error")
+                            fallback_triggered = True
+            
+            except Exception as e:
+                bot_log(f"[{acct_name}:{symbol.upper()}] SL Placement Exception: {e}", level="error")
+                fallback_triggered = True
+
+            # Fallback: Market Order
+            if fallback_triggered:
+                bot_log(f"[{acct_name}:{symbol.upper()}] ATTEMPTING MARKET CLOSE.", level="warning")
+                try:
+                    client.send_order({
+                        "orderType": "mkt", "symbol": symbol, "side": side, 
+                        "size": abs_size, "reduceOnly": True
+                    })
+                except Exception as e2:
+                    bot_log(f"[{acct_name}:{symbol.upper()}] Fallback Failed: {e2}", level="error")
+
+        # Handle TP Logic (Place Only)
+        if not has_tp:
+            if is_long:
+                tp_price = entry_price * (1 + tp_pct)
+            else:
+                tp_price = entry_price * (1 - tp_pct)
+            tp_price = self._round_to_step(tp_price, tick_size)
+
+            bot_log(f"[{acct_name}:{symbol.upper()}] TP MISSING. Placing at {tp_price}")
+            try:
+                client.send_order({
+                    "orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, 
+                    "limitPrice": tp_price, "reduceOnly": True
+                })
+            except Exception as e:
+                bot_log(f"[{acct_name}:{symbol.upper()}] TP Placement Failed: {e}", level="error")
+
+    # --- Slow Loop Logic (Entries) ---
+
+    def _process_entry_cycle(self):
+        new_params = self.fetcher.fetch_all_params()
+        if not new_params:
+            return
+        
+        with self.param_lock:
+            self.active_params = new_params
+        
+        # Check Equities on Both Accounts
+        try:
+            # Long Acc Equity
+            acc_l = self.kf_long.get_accounts()
+            if "flex" in acc_l.get("accounts", {}):
+                eq_l = float(acc_l["accounts"]["flex"].get("marginEquity", 0))
+            else:
+                eq_l = float(list(acc_l.get("accounts", {}).values())[0].get("marginEquity", 0))
+
+            # Short Acc Equity
+            acc_s = self.kf_short.get_accounts()
+            if "flex" in acc_s.get("accounts", {}):
+                eq_s = float(acc_s["accounts"]["flex"].get("marginEquity", 0))
+            else:
+                eq_s = float(list(acc_s.get("accounts", {}).values())[0].get("marginEquity", 0))
+
+            if eq_l <= 0 and eq_s <= 0: return
+
+        except Exception:
+            return
+
+        limited_keys = list(new_params.keys())[:TEST_ASSET_LIMIT]
+        limited_params = {k: new_params[k] for k in limited_keys}
+        active_assets_count = len(limited_params)
+        
+        if active_assets_count == 0: return
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for app_symbol, params in limited_params.items():
+                kraken_symbol = SYMBOL_MAP.get(app_symbol)
+                if not kraken_symbol: continue
+                
+                executor.submit(
+                    self._execute_entry_logic, 
+                    kraken_symbol, 
+                    eq_l, 
+                    eq_s,
+                    params, 
+                    active_assets_count
+                )
+
+    def _execute_entry_logic(self, symbol_str: str, eq_l: float, eq_s: float, params: Dict, asset_count: int):
+        time.sleep(random.uniform(0.1, 1.5))
+        
+        symbol_upper = symbol_str.upper()
+        symbol_lower = symbol_str.lower()
+        
+        grid_lines = np.sort(np.array(params["line_prices"]))
+        specs = self.instrument_specs.get(symbol_upper)
+        if not specs: return
+
+        # Get Mark Price (from Long client is fine, mark is universal)
+        current_price = self._get_mark_price(self.kf_long, symbol_upper)
+        if current_price == 0: return
+
+        # --- STEP 1: CLEANUP EXISTING ENTRIES ---
+        # We must cancel "Stale" limit orders from the previous grid cycle.
+        # But we MUST NOT cancel existing SL/TP orders (which are reduceOnly).
+        self._cancel_entry_orders(self.kf_long, symbol_lower)
+        self._cancel_entry_orders(self.kf_short, symbol_lower)
+
+        # --- STEP 2: PLACE NEW GRID ---
+        # Allocation
+        safe_equity_l = eq_l * 0.95
+        safe_equity_s = eq_s * 0.95
+        
+        # We use a fixed unit calculation based on equity
+        alloc_l = safe_equity_l / max(1, asset_count)
+        alloc_s = safe_equity_s / max(1, asset_count)
+        
+        unit_usd_l = (alloc_l * LEVERAGE) * 0.20
+        unit_usd_s = (alloc_s * LEVERAGE) * 0.20
+        
+        qty_l = self._round_to_step(unit_usd_l / current_price, specs["sizeStep"])
+        qty_s = self._round_to_step(unit_usd_s / current_price, specs["sizeStep"])
+
+        # Iterate EVERY line in params
+        for line in grid_lines:
+            price = self._round_to_step(line, specs["tickSize"])
+            
+            # LONG GRID (Buy Limits below Price) -> Post to Long Key
+            if price < current_price:
+                if qty_l >= specs["sizeStep"]:
+                    self.kf_long.send_order({
+                        "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
+                        "size": qty_l, "limitPrice": price
+                    })
+            
+            # SHORT GRID (Sell Limits above Price) -> Post to Short Key
+            elif price > current_price:
+                if qty_s >= specs["sizeStep"]:
+                    self.kf_short.send_order({
+                        "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
+                        "size": qty_s, "limitPrice": price
+                    })
+            
+            time.sleep(0.05) # Tiny sleep to prevent burst rate limits
+
+    def _cancel_entry_orders(self, client: KrakenFuturesApi, symbol_lower: str):
+        """
+        Fetches open orders and cancels only those that are Grid Entries.
+        Definition of Entry: Limit Order AND NOT reduceOnly.
+        """
+        try:
+            open_orders = client.get_open_orders().get("openOrders", [])
+            for o in open_orders:
+                if o["symbol"].lower() != symbol_lower: continue
+                
+                o_type = o.get("orderType", o.get("type", "")).lower()
+                o_reduce = o.get("reduceOnly", False)
+                o_trigger = o.get("triggerSignal", None)
+                
+                # Identify Entry Order
+                if o_type == "lmt" and not o_reduce and o_trigger is None:
+                    client.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
+        except Exception:
+            pass
+
+    # --- Helpers ---
+
+    def _get_mark_price(self, client: KrakenFuturesApi, kf_symbol_upper: str) -> float:
+        try:
+            tickers = client.get_tickers()
+            for t in tickers.get("tickers", []):
+                if t["symbol"].upper() == kf_symbol_upper:
+                    return float(t["markPrice"])
+            return 0.0
+        except Exception:
+            return 0.0
 
 if __name__ == "__main__":
-    bot = Octopus()
+    bot = OctopusGridBot()
     bot.initialize()
     bot.run()
