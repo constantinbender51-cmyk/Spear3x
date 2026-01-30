@@ -51,7 +51,7 @@ STRATEGY_URL = "https://spear3.up.railway.app/api/parameters"
 
 # Asset Mapping: App Symbol -> Kraken Futures Symbol
 SYMBOL_MAP = {
-    "BTC": "PF_XBTUSD",
+    "BTC": "FF_BTCUSD_270226",  # UPDATED from PF_XBTUSD
     "ETH": "PF_ETHUSD",
     "XRP": "PF_XRPUSD",
     "SOL": "PF_SOLUSD",
@@ -66,6 +66,13 @@ SYMBOL_MAP = {
     "HBAR": "PF_HBARUSD",
     "SHIB": "PF_SHIBUSD",
     "TON": "PF_TONUSD",
+}
+
+# Protected Symbols (NEVER Cancel Orders for these)
+PROTECTED_SYMBOLS = {
+    "PF_XBTUSD", 
+    "PF_BTCUSD", 
+    "FF_ETHUSD_270226"
 }
 
 # Logging Setup
@@ -139,10 +146,14 @@ class OctopusGridBot:
             else:
                 bot_log("Both API Connections Successful.")
 
-            bot_log("Startup: Canceling all open orders for mapped assets on BOTH accounts...")
+            bot_log("Startup: Canceling all open orders for mapped assets (Skipping Protected)...")
             unique_symbols = set(SYMBOL_MAP.values())
             
             for i, sym in enumerate(unique_symbols):
+                if sym.upper() in PROTECTED_SYMBOLS:
+                    bot_log(f"Skipping cancellation for protected symbol: {sym}")
+                    continue
+                    
                 try:
                     self.kf_long.cancel_all_orders({"symbol": sym.lower()})
                     self.kf_short.cancel_all_orders({"symbol": sym.lower()})
@@ -414,6 +425,10 @@ class OctopusGridBot:
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
+        # Guard: If this asset is protected, do NOT run entry/cancel logic
+        if symbol_upper in PROTECTED_SYMBOLS:
+            return
+
         grid_lines = np.sort(np.array(params["line_prices"]))
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
@@ -466,8 +481,11 @@ class OctopusGridBot:
     def _cancel_entry_orders(self, client: KrakenFuturesApi, symbol_lower: str):
         """
         Fetches open orders and cancels only those that are Grid Entries.
-        Definition of Entry: Limit Order AND NOT reduceOnly.
+        Protected symbols are strictly ignored.
         """
+        if symbol_lower.upper() in PROTECTED_SYMBOLS:
+            return
+
         try:
             open_orders = client.get_open_orders().get("openOrders", [])
             for o in open_orders:
